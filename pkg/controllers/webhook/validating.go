@@ -26,6 +26,8 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const maxWebhookMatchConditions = 64
+
 func buildWebhookRules(cfg config.Configuration, server, name, queryPath string, servicePort int32, caBundle []byte, policies []engineapi.GenericPolicy, expressionCache *expressionCache) []admissionregistrationv1.ValidatingWebhook {
 	var fineGrained, basic []engineapi.GenericPolicy
 	for _, policy := range policies {
@@ -52,6 +54,7 @@ func buildWebhookRules(cfg config.Configuration, server, name, queryPath string,
 		var fineGrainedIgnoreList, fineGrainedFailList []admissionregistrationv1.ValidatingWebhook
 		for _, policy := range fineGrained {
 			p := extractGenericPolicy(policy)
+			failurePolicy := p.GetFailurePolicy(toggle.FromContext(context.TODO()).ForceFailurePolicyIgnore())
 			webhook := admissionregistrationv1.ValidatingWebhook{
 				SideEffects:             &noneOnDryRun,
 				AdmissionReviewVersions: []string{"v1"},
@@ -119,6 +122,15 @@ func buildWebhookRules(cfg config.Configuration, server, name, queryPath string,
 						webhook.Rules = append(webhook.Rules, match.RuleWithOperations)
 					}
 				}
+				limit := maxWebhookMatchConditions
+				if failurePolicy != admissionregistrationv1.Ignore {
+					// The controller may append a bootstrap exclusion to Fail webhooks.
+					limit--
+				}
+				if len(webhook.MatchConditions) > limit {
+					// Keep evaluating the full set together in the policy engine.
+					webhook.MatchConditions = nil
+				}
 			}
 			if ivpol := policy.AsImageValidatingPolicyLike(); ivpol != nil {
 				policies, err := ivpolautogen.Autogen(ivpol)
@@ -161,7 +173,7 @@ func buildWebhookRules(cfg config.Configuration, server, name, queryPath string,
 			if p.GetTimeoutSeconds() != nil {
 				webhook.TimeoutSeconds = p.GetTimeoutSeconds()
 			}
-			if p.GetFailurePolicy(toggle.FromContext(context.TODO()).ForceFailurePolicyIgnore()) == admissionregistrationv1.Ignore {
+			if failurePolicy == admissionregistrationv1.Ignore {
 				webhook.FailurePolicy = ptr.To(admissionregistrationv1.Ignore)
 				webhook.Name = generateName(name+"-ignore-finegrained", p)
 				webhook.ClientConfig = newClientConfig(server, servicePort, caBundle, path.Join(queryPath, p.GetName()))
