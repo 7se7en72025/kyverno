@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
@@ -10,6 +11,7 @@ import (
 	matchutils "github.com/kyverno/kyverno/pkg/utils/match"
 	"go.uber.org/multierr"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,7 +27,10 @@ func (pc *policyController) createURForGeneratingPolicy(gpol *policiesv1beta1.Ge
 	if len(downstreams) == 0 {
 		// create a UR to restore the dynamic watcher cache in case backgound controller is restarted
 		pc.log.V(4).Info("no downstream resources found for generating policy, creating UR to restore dynamic watcher cache")
-		triggers := pc.getGeneratingPolicyTriggers(gpol.Spec.MatchConstraints, "")
+		triggers, err := pc.getGeneratingPolicyTriggers(gpol.Spec.MatchConstraints, "")
+		if err != nil {
+			return err
+		}
 		for _, trigger := range triggers {
 			addRuleContext(ur, gpol.GetName(), common.ResourceSpecFromUnstructured(*trigger.Unstructured), false, synchronize, true)
 		}
@@ -57,7 +62,10 @@ func (pc *policyController) createURForGeneratingPolicy(gpol *policiesv1beta1.Ge
 func (pc *policyController) handleGenerateExisting(gpol *policiesv1beta1.GeneratingPolicy) error {
 	ur := newGenerateUR(engineapi.NewGeneratingPolicy(gpol))
 	synchronize := gpol.Spec.SynchronizationEnabled()
-	triggers := pc.getGeneratingPolicyTriggers(gpol.Spec.MatchConstraints, "")
+	triggers, err := pc.getGeneratingPolicyTriggers(gpol.Spec.MatchConstraints, "")
+	if err != nil {
+		return err
+	}
 	for _, trigger := range triggers {
 		addRuleContext(ur, gpol.GetName(), common.ResourceSpecFromUnstructured(*trigger.Unstructured), false, synchronize, false)
 	}
@@ -83,7 +91,10 @@ func (pc *policyController) createURForNamespacedGeneratingPolicy(ngpol *policie
 	if len(downstreams) == 0 {
 		// create a UR to restore the dynamic watcher cache in case background controller is restarted
 		pc.log.V(4).Info("no downstream resources found for namespaced generating policy, creating UR to restore dynamic watcher cache")
-		triggers := pc.getGeneratingPolicyTriggers(ngpol.Spec.MatchConstraints, ngpol.GetNamespace())
+		triggers, err := pc.getGeneratingPolicyTriggers(ngpol.Spec.MatchConstraints, ngpol.GetNamespace())
+		if err != nil {
+			return err
+		}
 		for _, trigger := range triggers {
 			addRuleContext(ur, policyKey, common.ResourceSpecFromUnstructured(*trigger.Unstructured), false, synchronize, true)
 		}
@@ -115,7 +126,10 @@ func (pc *policyController) createURForNamespacedGeneratingPolicy(ngpol *policie
 func (pc *policyController) handleNamespacedGenerateExisting(ngpol *policiesv1beta1.NamespacedGeneratingPolicy) error {
 	ur := newGenerateUR(engineapi.NewNamespacedGeneratingPolicy(ngpol))
 	policyKey := ngpol.GetNamespace() + "/" + ngpol.GetName()
-	triggers := pc.getGeneratingPolicyTriggers(ngpol.Spec.MatchConstraints, ngpol.GetNamespace())
+	triggers, err := pc.getGeneratingPolicyTriggers(ngpol.Spec.MatchConstraints, ngpol.GetNamespace())
+	if err != nil {
+		return err
+	}
 	for _, trigger := range triggers {
 		addRuleContext(ur, policyKey, common.ResourceSpecFromUnstructured(*trigger.Unstructured), false, ngpol.Spec.SynchronizationEnabled(), false)
 	}
@@ -140,7 +154,7 @@ type gpolTrigger struct {
 // getGpolTriggers discovers existing matching resources for background
 // generation and trigger-based mutation. Discovery must resolve wildcard API
 // groups before listing, and matching/exclusions must precede deduplication.
-func (pc *policyController) getGpolTriggers(match *admissionregistrationv1.MatchResources, namespace string) []gpolTrigger {
+func (pc *policyController) getGpolTriggers(match *admissionregistrationv1.MatchResources, namespace string) ([]gpolTrigger, error) {
 	var triggers []gpolTrigger
 	seen := make(map[string]bool)
 	objectSelector := match.ObjectSelector
@@ -217,6 +231,11 @@ func (pc *policyController) getGpolTriggers(match *admissionregistrationv1.Match
 					}
 					resources, err := pc.client.ListResource(context.TODO(), groupVersion.String(), gvk.Kind, listNamespace, objectSelector)
 					if err != nil {
+						// Let the policy queue retry an incomplete scan before callers submit requests.
+						if apierrors.IsTooManyRequests(err) || apierrors.IsTimeout(err) ||
+							apierrors.IsServerTimeout(err) || apierrors.IsServiceUnavailable(err) {
+							return nil, fmt.Errorf("list triggers for %s in namespace %q: %w", baseGVR, listNamespace, err)
+						}
 						pc.log.Error(err, "failed to list resources", "groupVersion", groupVersion, "kind", gvk.Kind)
 						continue
 					}
@@ -242,7 +261,7 @@ func (pc *policyController) getGpolTriggers(match *admissionregistrationv1.Match
 			}
 		}
 	}
-	return filterTriggersByNamespace(triggers, namespace)
+	return filterTriggersByNamespace(triggers, namespace), nil
 }
 
 // resolveWildcardGroupTriggerGVRs expands a wildcard API group into concrete
@@ -298,8 +317,12 @@ func (pc *policyController) resolveWildcardGroupTriggerGVRs(versions []string, r
 // same parent object before a GeneratingPolicy creates RuleContexts. Generation
 // does not carry the admission SubResource into a RuleContext, unlike mutation.
 // Keep getGpolTriggers subresource-aware for MutatingPolicy callers.
-func (pc *policyController) getGeneratingPolicyTriggers(match *admissionregistrationv1.MatchResources, namespace string) []gpolTrigger {
-	return deduplicateGenerationTriggers(pc.getGpolTriggers(match, namespace))
+func (pc *policyController) getGeneratingPolicyTriggers(match *admissionregistrationv1.MatchResources, namespace string) ([]gpolTrigger, error) {
+	triggers, err := pc.getGpolTriggers(match, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return deduplicateGenerationTriggers(triggers), nil
 }
 
 // deduplicateGenerationTriggers retains the first eligible trigger for each

@@ -128,7 +128,8 @@ func TestGetGpolTriggersExcludeWildcard(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 	require.Len(t, triggers, 1)
 	assert.Equal(t, "keep-me", triggers[0].GetName())
 }

@@ -127,7 +127,8 @@ func TestGetGpolTriggers_WildcardAPIVersions(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 
 	// Wildcard must resolve to a single (preferred version) and list once,
 	// so each of the 2 distinct objects appears exactly once.
@@ -204,7 +205,8 @@ func TestGetGpolTriggers_SubresourceTrigger(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 	assert.Len(t, triggers, 1)
 	assert.Equal(t, "status", triggers[0].SubResource)
 }
@@ -271,7 +273,8 @@ func TestGetGpolTriggers_WildcardAPIVersions_Subresource(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 	assert.Len(t, triggers, 1)
 	assert.Equal(t, "status", triggers[0].SubResource)
 	assert.Equal(t, "my-pod", triggers[0].GetName())
@@ -339,7 +342,8 @@ func TestGetGpolTriggers_DeduplicateTriggers(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 	// Different admission subresources may have different mutation match conditions.
 	// Deduplicate repeated versions of the same context, not the base and status
 	// contexts of the same Kubernetes object.
@@ -400,7 +404,8 @@ func TestGetGpolTriggers_ConcreteAPIVersionUnaffected(t *testing.T) {
 		},
 	}
 
-	triggers := pc.getGpolTriggers(match, "")
+	triggers, err := pc.getGpolTriggers(match, "")
+	require.NoError(t, err)
 
 	assert.Len(t, triggers, 1)
 }
@@ -830,7 +835,8 @@ func TestGetGpolTriggers_WildcardAPIGroups(t *testing.T) {
 			}
 			dynamicClient := client.GetDynamicInterface().(*dynamicfake.FakeDynamicClient)
 			dynamicClient.ClearActions()
-			triggers := pc.getGpolTriggers(match, tc.policyNamespace)
+			triggers, err := pc.getGpolTriggers(match, tc.policyNamespace)
+			require.NoError(t, err)
 			if tc.wantNoList {
 				for _, action := range dynamicClient.Actions() {
 					assert.False(t, action.Matches("list", resource), "unexpected LIST for %s", resource)
@@ -873,7 +879,8 @@ func TestGetGpolTriggers_WildcardAPIGroups(t *testing.T) {
 				makeRule("v1alpha1", "configmaps/status"),
 			},
 		}
-		triggers := pc.getGpolTriggers(match, "")
+		triggers, err := pc.getGpolTriggers(match, "")
+		require.NoError(t, err)
 		require.Len(t, triggers, 2)
 		versionsBySubresource := make(map[string]string, len(triggers))
 		for _, trigger := range triggers {
