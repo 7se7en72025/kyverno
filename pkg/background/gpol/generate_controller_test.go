@@ -14,6 +14,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	gpolcompiler "github.com/kyverno/kyverno/pkg/cel/policies/gpol/compiler"
 	gpolengine "github.com/kyverno/kyverno/pkg/cel/policies/gpol/engine"
+	"github.com/kyverno/kyverno/pkg/cel/requestbudget"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/config"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
@@ -66,6 +67,60 @@ func (e *countingEngine) Handle(_ context.Context, _ celengine.EngineRequest, p 
 			Result: engineapi.RulePass("rule", engineapi.Generation, "ok", nil),
 		}},
 	}, nil
+}
+
+type budgetChargingEngine struct {
+	testEngine
+}
+
+func (e *budgetChargingEngine) Handle(ctx context.Context, request celengine.EngineRequest, policy gpolengine.Policy, restore bool) (gpolengine.EngineResponse, error) {
+	ctx, release := requestbudget.EnsureBackground(ctx)
+	defer release()
+	// Each trigger fits on its own, but the two charges cannot share one budget.
+	if err := requestbudget.Charge(ctx, 1_600_000); err != nil {
+		return gpolengine.EngineResponse{}, err
+	}
+	return e.testEngine.Handle(ctx, request, policy, restore)
+}
+
+func TestProcessUR_UsesIndependentTriggerBudgets(t *testing.T) {
+	previousReporting := reportutils.ReportingCfg
+	reportutils.ReportingCfg = reportutils.NewReportingConfig(nil)
+	t.Cleanup(func() { reportutils.ReportingCfg = previousReporting })
+
+	const namespace = "tenant-a"
+	const policyName = "test-gpol"
+	client := &partialReproClient{objects: make(map[string]*unstructured.Unstructured)}
+	ur := &kyvernov2.UpdateRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "ur-multiple-triggers"},
+		Spec:       kyvernov2.UpdateRequestSpec{Type: kyvernov2.CELGenerate, Policy: policyName},
+	}
+	for _, name := range []string{"first", "second"} {
+		trigger := makeUnstructured("", "", "v1", "ConfigMap", name, namespace, types.UID("uid-"+name), nil)
+		client.objects["ConfigMap/"+namespace+"/"+name] = trigger
+		ur.Spec.RuleContext = append(ur.Spec.RuleContext, kyvernov2.RuleContext{
+			Trigger: common.ResourceSpecFromUnstructured(*trigger),
+		})
+	}
+
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{{Version: "v1"}})
+	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
+	status := &recordingStatusControl{}
+	policy := &policiesv1beta1.GeneratingPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName}}
+	controller := &CELGenerateController{
+		client:        client,
+		restMapper:    mapper,
+		context:       libs.NewFakeContextProvider(),
+		engine:        &budgetChargingEngine{},
+		provider:      &testProvider{policy: gpolengine.Policy{Policy: policy}},
+		watchManager:  &WatchManager{},
+		statusControl: status,
+		eventGen:      testEventGen{},
+		log:           logging.WithName("test-gpol-budget"),
+	}
+
+	require.NoError(t, controller.ProcessUR(ur))
+	require.True(t, status.success, status.message)
 }
 
 type testProvider struct {

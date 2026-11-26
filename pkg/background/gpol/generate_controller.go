@@ -13,7 +13,6 @@ import (
 	celengine "github.com/kyverno/kyverno/pkg/cel/engine"
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	gpolengine "github.com/kyverno/kyverno/pkg/cel/policies/gpol/engine"
-	"github.com/kyverno/kyverno/pkg/cel/requestbudget"
 	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/config"
@@ -95,11 +94,7 @@ func (c *CELGenerateController) ProcessUR(ur *kyvernov2.UpdateRequest) error {
 	logger.V(2).Info("start processing UR", "ur", ur.Name, "resourceVersion", ur.GetResourceVersion())
 
 	var failures []error
-	// One cost budget for the whole update request, established outside the loop. Inside
-	// it, every iteration would start from a fresh context and so get its own ceiling,
-	// which bounds each rule context rather than the request that contains them.
-	ctx, releaseBudget := requestbudget.EnsureBackground(context.TODO())
-	defer releaseBudget()
+	ctx := context.TODO()
 	for i := 0; i < len(ur.Spec.RuleContext); i++ {
 		if ur.Spec.RuleContext[i].DeleteDownstream {
 			c.watchManager.DeleteDownstreams(ur.Spec.GetPolicyKey(), &ur.Spec.RuleContext[i].Trigger)
@@ -171,6 +166,7 @@ func (c *CELGenerateController) ProcessUR(ur *kyvernov2.UpdateRequest) error {
 		// Covers engine.Handle's write and the SyncWatchers call below that
 		// catches the watcher cache up; keyed like the labels the engine stamps.
 		endGenerate := c.watchManager.BeginGenerate(ur.Spec.GetPolicyKey(), trigger.GetUID())
+		// The engine starts a CEL budget for this trigger, regardless of the batch size.
 		gpolResponse, err := c.engine.Handle(ctx, request, policy, ur.Spec.RuleContext[i].CacheRestore)
 		if err != nil {
 			endGenerate()
