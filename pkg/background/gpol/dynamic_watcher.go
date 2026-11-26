@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 	watchTools "k8s.io/client-go/tools/watch"
@@ -812,6 +813,34 @@ func (wm *WatchManager) handleAdd(obj *unstructured.Unstructured, gvr schema.Gro
 	wm.log.V(4).Info("Resource added", "name", obj.GetName(), "namespace", obj.GetNamespace())
 }
 
+// listSourceDownstreams uses the cached clone references to scope the live list.
+// The caller holds wm.lock.
+func (wm *WatchManager) listSourceDownstreams(source *unstructured.Unstructured, watcher *watcher) []unstructured.Unstructured {
+	uid := string(source.GetUID())
+	if uid == "" {
+		return nil
+	}
+	namespaces := sets.New[string]()
+	for _, downstream := range watcher.metadataCache {
+		if downstream.Labels[common.GenerateSourceUIDLabel] == uid {
+			namespaces.Insert(downstream.Namespace)
+		}
+	}
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{common.GenerateSourceUIDLabel: uid},
+	}
+	var downstreams []unstructured.Unstructured
+	for _, namespace := range sets.List(namespaces) {
+		list, err := wm.client.ListResource(context.TODO(), source.GetAPIVersion(), source.GetKind(), namespace, selector)
+		if err != nil {
+			wm.log.Error(err, "failed to list downstream resources", "namespace", namespace)
+			continue
+		}
+		downstreams = append(downstreams, list.Items...)
+	}
+	return downstreams
+}
+
 func (wm *WatchManager) handleUpdate(obj *unstructured.Unstructured, gvr schema.GroupVersionResource) {
 	wm.lock.Lock()
 	defer wm.lock.Unlock()
@@ -833,16 +862,7 @@ func (wm *WatchManager) handleUpdate(obj *unstructured.Unstructured, gvr schema.
 			source.SetCreationTimestamp(metav1.Time{})
 			source.SetManagedFields(nil)
 			source.SetResourceVersion("")
-			// fetch downstreams that have the source UID label.
-			sourceLabel := map[string]string{
-				common.GenerateSourceUIDLabel: string(uid),
-			}
-			selector := &metav1.LabelSelector{MatchLabels: sourceLabel}
-			downstreams, err := wm.client.ListResource(context.TODO(), obj.GetAPIVersion(), obj.GetKind(), "", selector)
-			if err != nil {
-				wm.log.Error(err, "failed to list downstream resources")
-			}
-			for _, downstream := range downstreams.Items {
+			for _, downstream := range wm.listSourceDownstreams(obj, watcher) {
 				// if the downstream doesn't exist in the metadata cache, it means sync is disabled.
 				cached, exists := watcher.metadataCache[downstream.GetUID()]
 				if !exists {
@@ -1156,21 +1176,10 @@ func (wm *WatchManager) handleDelete(obj *unstructured.Unstructured, gvr schema.
 		// the source resource is deleted, we need to clean up the downstream resources.
 		if !managedBy {
 			wm.log.V(4).Info("source resource deleted, removing downstreams", "name", obj.GetName(), "namespace", obj.GetNamespace())
-			// fetch downstreams that have the source UID label.
-			sourceLabel := map[string]string{
-				common.GenerateSourceUIDLabel: string(uid),
-			}
-			selector := &metav1.LabelSelector{MatchLabels: sourceLabel}
-			downstreams, err := wm.client.ListResource(context.TODO(), obj.GetAPIVersion(), obj.GetKind(), "", selector)
-			if err != nil {
-				wm.log.Error(err, "failed to list downstream resources")
-			} else {
-				for _, downstream := range downstreams.Items {
-					// if the downstream doesn't exist in the metadata cache, it means sync is disabled.
-					if _, exists := watcher.metadataCache[downstream.GetUID()]; !exists {
-						continue
-					}
-					wm.deleteCachedDownstream(wm.log, watcher, downstream.GetUID(), watcher.metadataCache[downstream.GetUID()])
+			for _, downstream := range wm.listSourceDownstreams(obj, watcher) {
+				// if the downstream doesn't exist in the metadata cache, it means sync is disabled.
+				if cached, exists := watcher.metadataCache[downstream.GetUID()]; exists {
+					wm.deleteCachedDownstream(wm.log, watcher, downstream.GetUID(), cached)
 				}
 			}
 		} else {
