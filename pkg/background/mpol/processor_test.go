@@ -23,6 +23,7 @@ import (
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1alpha1 "k8s.io/api/admissionregistration/v1alpha1"
@@ -33,6 +34,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clienttesting "k8s.io/client-go/testing"
 )
 
 var (
@@ -716,6 +719,7 @@ func newRemoveAFixture(t *testing.T) (dclient.Interface, versioned.Interface, me
 	cm.SetKind("ConfigMap")
 	cm.SetNamespace("shared")
 	cm.SetName("shared-cm")
+	cm.SetUID("listed-configmap")
 	cm.SetResourceVersion("1")
 	assert.NoError(t, unstructured.SetNestedStringMap(cm.Object, map[string]string{"a": "1"}, "data"))
 	gvrToListKind := map[schema.GroupVersionResource]string{
@@ -783,6 +787,27 @@ func TestProcess_TargetChangedDuringEvaluation_KeepsTheOtherWrite(t *testing.T) 
 	data, sc := runRemoveA(t, fakeClient, kyvernoClient, restMapper, eng)
 	assert.Equal(t, map[string]string{"b": "2"}, data)
 	assert.False(t, sc.failedCalled)
+}
+
+func TestProcess_SkipsReplacementTarget(t *testing.T) {
+	client, kyvernoClient, restMapper := newRemoveAFixture(t)
+	replacement, err := client.GetResource(context.Background(), "v1", "ConfigMap", "shared", "shared-cm")
+	require.NoError(t, err)
+	replacement.SetUID("replacement-configmap")
+	replacement.SetResourceVersion("2")
+
+	dynamicClient := client.GetDynamicInterface().(*dynamicfake.FakeDynamicClient)
+	dynamicClient.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, replacement.DeepCopy(), nil
+	})
+
+	eng := &removeKeyEngine{}
+	_, status := runRemoveA(t, client, kyvernoClient, restMapper, eng)
+	assert.Equal(t, 1, eng.calls)
+	assert.True(t, status.successCalled)
+	for _, action := range dynamicClient.Actions() {
+		assert.False(t, action.Matches("update", "configmaps"), "the replacement must not be updated")
+	}
 }
 
 // When the target changed since it was listed and re-evaluating it does not give a new

@@ -309,6 +309,7 @@ func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
 				}
 				continue
 			}
+			listedUID := object.GetUID()
 			listedResourceVersion := object.GetResourceVersion()
 			object, err = p.client.GetResource(context.TODO(), object.GetAPIVersion(), object.GetKind(), object.GetNamespace(), object.GetName())
 			if err != nil {
@@ -318,6 +319,10 @@ func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
 					continue
 				}
 				failures = append(failures, fmt.Errorf("failed to refresh target resource for mpol %s: %v", ur.Spec.GetPolicyKey(), err))
+				continue
+			}
+			if object.GetUID() != listedUID {
+				// The listed target was deleted. Its replacement needs its own target selection.
 				continue
 			}
 			// The patch above was computed from the listed copy of the target; if the target has
